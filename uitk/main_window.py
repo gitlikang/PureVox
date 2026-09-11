@@ -116,9 +116,11 @@ class NodeRow(tk.Frame):
 
     def __init__(self, parent, cfg, spec, sizes, fonts,
                  on_remove=None, on_toggle=None, on_drag_preview=None,
-                 on_drag_commit=None, on_param=None, icon_font=None):
+                 on_drag_commit=None, on_param=None, icon_font=None,
+                 body_bg=None):
         self.sizes = sizes
         self.fonts = fonts
+        self.body_bg = body_bg or theme.BASE   # 行内容区底色（输出行为暖灰）
         self._on_drag_preview = on_drag_preview
         self._on_drag_commit = on_drag_commit
         self.cfg = cfg            # {type, enabled, params} 引用
@@ -185,7 +187,7 @@ class NodeRow(tk.Frame):
         self._far_items = {}
         self._build_far_combo()
         # 多参数/编辑入口/viz 走下方参数区（始终显示）
-        self.body_frame = tk.Frame(self, bg=theme.BASE)
+        self.body_frame = tk.Frame(self, bg=self.body_bg)
         self._build_ec_body()
         self._build_inline(on_param)
         self.ensure_body()
@@ -245,9 +247,9 @@ class NodeRow(tk.Frame):
 
     def _ec_line(self, label):
         """下方参数区一行：固定宽左标签 + 右侧控件（撑满剩余宽度）。"""
-        line = tk.Frame(self.body_frame, bg=theme.BASE)
+        line = tk.Frame(self.body_frame, bg=self.body_bg)
         line.pack(fill=tk.X, padx=self.sizes["pad_sm"], pady=2)
-        tk.Label(line, text=label, bg=theme.BASE, fg=theme.TEXT_DIM,
+        tk.Label(line, text=label, bg=self.body_bg, fg=theme.TEXT_DIM,
                  font=self.fonts.get("small"), width=self._LBL_W,
                  anchor="w").pack(side=tk.LEFT, padx=(0, self.sizes["pad_sm"]))
         return line
@@ -288,7 +290,7 @@ class NodeRow(tk.Frame):
                               font=self.fonts.get("body"))
         auto_btn.pack(side=tk.RIGHT, padx=(0, 4))
         self._aec_auto_btn = auto_btn
-        delay_lbl = tk.Label(delay_line, text="0ms", bg=theme.BASE,
+        delay_lbl = tk.Label(delay_line, text="0ms", bg=self.body_bg,
                              fg=theme.TEXT, font=self.fonts.get("small"),
                              width=7, anchor="e")
         delay_lbl.pack(side=tk.RIGHT, padx=(4, 0))
@@ -306,13 +308,13 @@ class NodeRow(tk.Frame):
             delay_slider.set_value(min(1000.0, max(0.0, saved_ms)))
             delay_lbl.config(text=f"{saved_ms:.0f}ms")
         # ── 三路电平 Mic/Far/Out（放在延迟滑块下方）──
-        vu_frame = tk.Frame(self.body_frame, bg=theme.BASE)
+        vu_frame = tk.Frame(self.body_frame, bg=self.body_bg)
         vu_frame.pack(fill=tk.X, padx=self.sizes["pad_sm"], pady=2)
         self._aec_vu_widgets = {}
         for key, label in [("mic", "Mic"), ("far", "Far"), ("out", "Out")]:
-            row = tk.Frame(vu_frame, bg=theme.BASE)
+            row = tk.Frame(vu_frame, bg=self.body_bg)
             row.pack(fill=tk.X, pady=1)
-            tk.Label(row, text=label, bg=theme.BASE, fg=theme.TEXT_DIM,
+            tk.Label(row, text=label, bg=self.body_bg, fg=theme.TEXT_DIM,
                      font=self.fonts.get("small"), width=self._LBL_W,
                      anchor="w").pack(side=tk.LEFT,
                                       padx=(0, self.sizes["pad_sm"]))
@@ -530,7 +532,6 @@ class MainWindowTk:
         from .metrics import enable_hidpi
         enable_hidpi()
         self.config = config
-        self._vb_cable_names = set()   # VB-CABLE 设备名集合（refresh_devices 填充）
         self.root = tk.Tk()
         fix_tk_scaling(self.root)
         family = pick_font_family(self.root)
@@ -1119,6 +1120,10 @@ class MainWindowTk:
 
     def _make_row(self, cfg, spec):
         row = NodeRow(self.panel, cfg, spec, self.sizes, self.fonts,
+                      # 音频输出行 body 用暖灰（与 FaderSlider 画布同色），
+                      # 其余行保持纯白默认
+                      body_bg=(theme.OUTPUT_ROW_BODY
+                               if spec.name == "audio_output" else None),
                       on_remove=lambda: self.remove_row(row),
                       on_drag_preview=self._move_row_live,
                       on_drag_commit=self._apply_chain_change,
@@ -1167,7 +1172,7 @@ class MainWindowTk:
         # 虚拟输出设备行：内嵌 VB-CABLE 驱动状态卡（原检测面板内容）
         if spec.name == "virtual_output":
             self._attach_vb_card(row)
-        # 本地输出设备行：选 VB-CABLE 端点时显示 CABLE Output 音量条
+        # 本地输出设备行：常显双端点音量条（VB-CABLE 录音端点 + 下拉选中的输出设备播放端点）
         if spec.name == "audio_output":
             self._attach_local_output_volume(row)
         # 全部行内内容就绪后统一显示参数区（无展开收起）
@@ -1289,83 +1294,121 @@ class MainWindowTk:
                   pady=self.sizes["pad_sm"])
 
     def _attach_local_output_volume(self, row):
-        """本地输出设备行内 CABLE Output 端点音量条（实时回显 + 可调）。
+        """本地输出设备行内双端点音量条（实时回显 + 可调，Windows 常显）。
 
-        仅当所选输出设备为 VB-CABLE 端点（CABLE Input）时显示；滑杆读写
-        Windows 录音端点 "CABLE Output" 主音量——其他软件 AGC 调的就是它。
-        显示/隐藏与回显均在 _viz_tick 33ms 周期内完成，拖动时设 vol_dragging
-        防止外部读回把滑杆拽回去。非 Windows 或无端点时面板隐藏。
+        不随下拉框选择隐藏，共两条滑杆：
+        - 录音端点（CABLE_OUTPUT_KEY）：Windows 录音设备里的 CABLE Output，
+          其他软件 AGC 调的就是它；
+        - 播放端点：下拉框选中的输出设备本身（PureVox 处理后音频的写入端），
+          key/title 均跟随下拉框动态变化，未选择时回退 CABLE Input。
+        播放端点按 FriendlyName 子串定位（_find_dev 回退路径），选中设备即
+        精确匹配自身；录音端点走稳定逻辑键（驱动描述+设备 ID 前缀），
+        与 FriendlyName 无关，用户重命名设备后读写仍生效。
+        回显在 _viz_tick 33ms 周期内完成，拖动时设 vol_dragging 防止
+        外部读回把滑杆拽回去。非 Windows 无端点音量接口，面板不挂载。
         """
+        from pvplatform import IS_WINDOWS
+        if not IS_WINDOWS:
+            return
         S, F = self.sizes, self.fonts
-        from pvplatform.system import CABLE_OUTPUT_KEY
-        _KEY = CABLE_OUTPUT_KEY   # 后端逻辑键，非 FriendlyName（可重命名）
-        holder = tk.Frame(row.body_frame, bg=theme.BASE)
+        from pvplatform.system import CABLE_OUTPUT_KEY, CABLE_INPUT_KEY
+        holder = tk.Frame(row.body_frame, bg=row.body_bg)
         row.vol_holder = holder
         row.vol_dragging = False
         row.vol_visible = False
-        # 标签文本动态更新（_viz_tick 中用实际 FriendlyName 替换）；
-        # 初始用通用占位，避免写死可重命名的 "CABLE Output"
-        row.vol_title_lbl = tk.Label(holder, text="VB-CABLE 音量", bg=theme.BASE,
-                                     fg=theme.TEXT_DIM, font=F.get("small"))
-        row.vol_title_lbl.pack(side=tk.LEFT, padx=(0, S["pad_sm"]))
-        row.vol_lbl = tk.Label(holder, text="--%", bg=theme.BASE,
-                              fg=theme.TEXT, font=F.get("bold"),
-                              anchor="w", width=7, cursor="hand2")
-        row.vol_lbl.pack(side=tk.RIGHT, padx=(2, 0))
-        ref = {"s": None, "muted": False}
 
-        def _on_vol():
-            # 拖动中只更新百分比标签，不写 COM（避免 30+/s 端点写入卡顿）
-            # 静音态下拖动时临时显示百分比，松手写回时自动取消静音
-            pct = ref["s"].value
-            row.vol_lbl.configure(text=f"{pct:.0f}%")
+        def _title_out():
+            # 录音端点标题：按稳定规则回读实际 FriendlyName（抗重命名），
+            # 回读失败退回通用占位，避免写死可重命名的 "CABLE Output"
+            from pvplatform.system import get_cable_output_name
+            return f"{get_cable_output_name() or 'VB-CABLE'} 音量"
 
-        def _commit_vol():
-            # 松手时一次性写回 Windows 端点主音量；写失败时下个 viz tick
-            # 会读回真实音量并把滑杆拽回，形成自然的视觉反馈
-            try:
-                from pvplatform.system import set_endpoint_volume_pct, set_endpoint_mute
-                # 拖动滑杆 = 用户明确要调音量，无条件取消静音（Windows 惯例）。
-                # 不能只看 ref["muted"]——外部静音（系统托盘/其他软件）时该
-                # flag 不会更新，必须无条件取消才能保证拖动后有声音。
-                set_endpoint_mute(_KEY, False)
-                ref["muted"] = False
-                set_endpoint_volume_pct(_KEY, ref["s"].value / 100.0)
-            except Exception:
-                pass
+        def _key_in():
+            # 播放端点定位键 = 下拉框选中的设备本身（_find_dev 按
+            # FriendlyName 子串精确匹配自身）；未选择时回退 CABLE Input
+            d = str((row.cfg.get("params") or {}).get("device", "")).strip()
+            return d or CABLE_INPUT_KEY
 
-        def _toggle_mute(e=None):
-            # 点击百分比标签切换静音（Windows 音量惯例）
-            try:
-                from pvplatform.system import set_endpoint_mute, get_endpoint_mute
-                cur = get_endpoint_mute(_KEY)
-                if cur is None:
-                    return
-                new_mute = not cur
-                if set_endpoint_mute(_KEY, new_mute):
-                    ref["muted"] = new_mute
-                    ref["s"].set_muted(new_mute)
-                    if new_mute:
-                        row.vol_lbl.configure(text="🔇静音")
-                    else:
-                        # 取消静音后立即刷新百分比
-                        from pvplatform.system import get_endpoint_volume_pct
-                        v = get_endpoint_volume_pct(_KEY)
-                        if v is not None:
-                            row.vol_lbl.configure(text=f"{int(round(v * 100))}%")
-            except Exception:
-                pass
+        def _title_in():
+            # 播放端点标题：即下拉框选中的设备本身（枚举期 FriendlyName）
+            d = str((row.cfg.get("params") or {}).get("device", ""))
+            return f"{d or 'CABLE Input'} 音量"
 
-        from .widgets import HSlider
-        s = HSlider(holder, 0, 100, 50, 1, sizes=S, command=_on_vol)
-        ref["s"] = s
-        row.vol_slider = s
-        row.vol_toggle_mute = _toggle_mute
-        s.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        s.bind("<ButtonPress-1>", lambda e: setattr(row, "vol_dragging", True))
-        s.bind("<ButtonRelease-1>",
-               lambda e: (setattr(row, "vol_dragging", False), _commit_vol()))
-        row.vol_lbl.bind("<Button-1>", _toggle_mute)
+        def _make_vol_row(key_fn, title_fn):
+            """创建一条端点音量推子：标题/数值画在推子内（CustomFader 造型）。"""
+            ref = {"s": None, "muted": False}
+            line = tk.Frame(holder, bg=row.body_bg)
+            line.pack(fill=tk.X, pady=(0, S["pad_sm"]))
+
+            def _on_vol():
+                # 拖动中只更新底部数值文本，不写 COM（避免 30+/s 端点写入卡顿）
+                # 静音态下拖动时临时显示百分比，松手写回时自动取消静音
+                ref["s"].set_val_text(f"{ref['s'].value:.0f}%")
+
+            def _commit_vol():
+                # 松手时一次性写回 Windows 端点主音量；写失败时下个 viz tick
+                # 会读回真实音量并把推子拽回，形成自然的视觉反馈
+                try:
+                    from pvplatform.system import (set_endpoint_volume_pct,
+                                                   set_endpoint_mute)
+                    # 拖动推子 = 用户明确要调音量，无条件取消静音（Windows
+                    # 惯例）。不能只看 ref["muted"]——外部静音（系统托盘/
+                    # 其他软件）时该 flag 不会更新，必须无条件取消才能保证
+                    # 拖动后有声音。
+                    set_endpoint_mute(key_fn(), False)
+                    ref["muted"] = False
+                    set_endpoint_volume_pct(key_fn(), ref["s"].value / 100.0)
+                except Exception:
+                    pass
+
+            def _toggle_mute(e=None):
+                # 点击底部数值文本切换静音（Windows 音量惯例）
+                try:
+                    from pvplatform.system import (set_endpoint_mute,
+                                                   get_endpoint_mute)
+                    key = key_fn()
+                    cur = get_endpoint_mute(key)
+                    if cur is None:
+                        return
+                    new_mute = not cur
+                    if set_endpoint_mute(key, new_mute):
+                        ref["muted"] = new_mute
+                        ref["s"].set_muted(new_mute)
+                        if new_mute:
+                            ref["s"].set_val_text("🔇静音")
+                        else:
+                            # 取消静音后立即刷新百分比
+                            from pvplatform.system import get_endpoint_volume_pct
+                            v = get_endpoint_volume_pct(key)
+                            if v is not None:
+                                ref["s"].set_val_text(f"{int(round(v * 100))}%")
+                except Exception:
+                    pass
+
+            def _press(e):
+                # 底部数值文本区是静音点击区，不能当作拖动起点
+                row.vol_dragging = not ref["s"].in_label_zone(e.y)
+
+            def _release(e):
+                if getattr(row, "vol_dragging", False):
+                    row.vol_dragging = False
+                    _commit_vol()
+
+            from .widgets import FaderSlider
+            s = FaderSlider(line, 0, 100, 50, 1, sizes=S, fonts=F,
+                            height=120, thumb_h=48, command=_on_vol,
+                            title_text=title_fn(),
+                            on_label_click=_toggle_mute)
+            ref["s"] = s
+            s.pack(fill=tk.X)
+            s.bind("<ButtonPress-1>", _press)
+            s.bind("<ButtonRelease-1>", _release)
+            return {"key_fn": key_fn, "slider": s, "title_fn": title_fn}
+
+        row.vol_rows = [
+            _make_vol_row(lambda: CABLE_OUTPUT_KEY, _title_out),
+            _make_vol_row(_key_in, _title_in),
+        ]
 
     def _attach_music_player(self, row):
         """音乐播放器行内控制：选曲目 + 进度滑块（可拖 seek）；
@@ -1609,52 +1652,47 @@ class MainWindowTk:
                     meter.update_gain(None)
             except Exception as e:
                 meter.update_gain(None)
-        # 本地输出设备行：CABLE Output 端点音量实时回显（复用 viz tick 33ms）
+        # 本地输出设备行：双端点音量实时回显（复用 viz tick 33ms）。
+        # Windows 常显，不随下拉框选择隐藏：推子 1 = VB-CABLE 录音端点
+        # （CABLE Output），推子 2 = 下拉框选中的输出设备播放端点
+        # （key/title 均跟随下拉框动态变化）
         for row in self.rows:
             holder = getattr(row, "vol_holder", None)
             if holder is None:
                 continue
             try:
-                dev = str((row.cfg.get("params") or {}).get("device", ""))
-                # 用 refresh_devices 缓存的 VB-CABLE 设备名集合判断，
-                # 替代硬编码 'CABLE' 子串匹配（用户重命名设备后仍生效）
-                vb_names = getattr(self, "_vb_cable_names", set())
-                if dev not in vb_names:
-                    if getattr(row, "vol_visible", False):
-                        holder.pack_forget()
-                        row.vol_visible = False
-                    continue
                 if not getattr(row, "vol_visible", False):
+                    # 上下留白对齐左右（pad_lg=10）：底侧 line 已自带 pad_sm，
+                    # holder 底距补 pad_lg-pad_sm，合计恰为 pad_lg
                     holder.pack(fill=tk.X, padx=self.sizes["pad_lg"],
-                                pady=(0, self.sizes["pad_sm"]))
+                                pady=(self.sizes["pad_lg"],
+                                      self.sizes["pad_lg"] - self.sizes["pad_sm"]))
                     row.vol_visible = True
                 if getattr(row, "vol_dragging", False):
                     continue
-                from pvplatform.system import (CABLE_OUTPUT_KEY,
-                                               get_endpoint_volume_pct,
-                                               get_endpoint_mute,
-                                               get_cable_output_name)
-                # 动态标签：用实际 FriendlyName（抗重命名），仅在变化时更新
-                actual_name = get_cable_output_name()
-                if actual_name:
-                    title = f"{actual_name} 音量"
-                    if row.vol_title_lbl.cget("text") != title:
-                        row.vol_title_lbl.configure(text=title)
-                pct = get_endpoint_volume_pct(CABLE_OUTPUT_KEY)
-                if pct is None:
-                    row.vol_lbl.configure(text="--%")
-                    row.vol_slider.set_muted(False)
-                    continue
-                # 静音状态：与音量一起读（同一缓存 AudioDevice，开销极小）
-                muted = get_endpoint_mute(CABLE_OUTPUT_KEY)
-                if muted:
-                    row.vol_slider.set_muted(True)
-                    row.vol_lbl.configure(text="🔇静音")
-                else:
-                    row.vol_slider.set_muted(False)
-                    v = int(round(pct * 100))
-                    row.vol_slider.set_value(v, silent=True)
-                    row.vol_lbl.configure(text=f"{v}%")
+                from pvplatform.system import (get_endpoint_volume_pct,
+                                               get_endpoint_mute)
+                # 两条推子逐条回显：录音端点（CABLE Output）+ 播放端点
+                # （选中的输出设备）；标题/数值画在推子内，
+                # set_title_text/set_val_text 内容未变时跳过重绘
+                for e in getattr(row, "vol_rows", []):
+                    key = e["key_fn"]()
+                    e["slider"].set_title_text(e["title_fn"]())
+                    pct = get_endpoint_volume_pct(key)
+                    if pct is None:
+                        e["slider"].set_val_text("--%")
+                        e["slider"].set_muted(False)
+                        continue
+                    # 静音状态：与音量一起读（同一缓存 AudioDevice，开销极小）
+                    muted = get_endpoint_mute(key)
+                    if muted:
+                        e["slider"].set_muted(True)
+                        e["slider"].set_val_text("🔇静音")
+                    else:
+                        e["slider"].set_muted(False)
+                        v = int(round(pct * 100))
+                        e["slider"].set_value(v, silent=True)
+                        e["slider"].set_val_text(f"{v}%")
             except Exception:
                 pass
         # ── AEC 行 VU 电平表更新（10fps，降 CPU）──
@@ -1825,27 +1863,28 @@ class MainWindowTk:
             out_names = [t for t, _d in devs.get("outputs", [])]
             in_names = [t for t, _d in devs.get("inputs", [])]
             # VB-CABLE 设备名集合（抗用户重命名）：后端按驱动描述识别，
-            # 不依赖 FriendlyName 子串。UI 层用此集合判断选中设备是否
-            # VB-CABLE，替代硬编码 'CABLE' 匹配。
+            # 不依赖 FriendlyName 子串，用于双端存在判断
             vb_names = set()
             try:
                 from pvplatform.system import get_vb_cable_names
                 vb_names = get_vb_cable_names()
             except Exception:
                 pass
-            self._vb_cable_names = vb_names
             # 双端存在判断：输出设备列表与 VB 集合有交集，且输入设备列表
             # 也有交集（CABLE Input 是输出端点，CABLE Output 是输入端点）
             vb_ok = bool(vb_names and (set(out_names) & vb_names)
                          and (set(in_names) & vb_names))
-            # 预热 CABLE Output 端点音量缓存：后台线程内完成首次全量枚举，
-            # 避免首个 _viz_tick 在主线程 cache miss 卡顿。仅 VB-CABLE 双端
+            # 预热 VB-CABLE 双端点音量缓存（录音 CABLE Output + 播放
+            # CABLE Input）：后台线程内完成首次全量枚举，避免首个
+            # _viz_tick 在主线程 cache miss 卡顿。仅 VB-CABLE 双端
             # 都存在时才预热（非 VB 场景不浪费一次设备枚举）
             if vb_ok:
                 try:
                     from pvplatform.system import (get_endpoint_volume_pct,
-                                                   CABLE_OUTPUT_KEY)
+                                                   CABLE_OUTPUT_KEY,
+                                                   CABLE_INPUT_KEY)
                     get_endpoint_volume_pct(CABLE_OUTPUT_KEY)
+                    get_endpoint_volume_pct(CABLE_INPUT_KEY)
                 except Exception:
                     pass
 

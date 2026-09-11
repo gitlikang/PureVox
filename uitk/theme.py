@@ -29,6 +29,9 @@ BUTTON      = "#FFB74D"   # 南瓜橙主按钮
 DARK        = "#FFE0B2"   # 悬停底
 MID         = "#8D6E63"   # 木纹边框/分隔线
 TRACK       = "#E6C79A"   # 滑杆槽（介于面板与边框之间）
+OUTPUT_ROW_BODY = "#1e1e1e"  # 音频输出行 body（与 FaderSlider 画布同色1e1e1e）
+FADERSLIDER_RECTANGLE = "#2b2b2b"  # 音频输出行 （推子滑动轨道背景矩形颜色2b2b2b）
+
 
 # ── 标题栏（深棕锚点，lite 同源）──
 TITLE_BG    = "#6D4C41"

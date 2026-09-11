@@ -331,6 +331,252 @@ class HSlider(tk.Canvas):
         self._set_from_x(e.x)
 
 
+def _fader_png_path() -> str:
+    """定位推子帽贴图 assets/icons/fader.png（打包态 _MEIPASS → 仓库根）。
+
+    Windows PyInstaller 打包须随包携带（build_win.ps1 --add-data）；
+    找不到返回空串，FaderSlider 回退自绘矩形把手。
+    """
+    import os
+    import sys
+    here = os.path.dirname(os.path.abspath(__file__))
+    roots = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(meipass)
+    roots.append(os.path.dirname(here))
+    for r in roots:
+        p = os.path.join(r, "assets", "icons", "fader.png")
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+class FaderSlider(tk.Canvas):
+    """音量推子（按 tests/test_slider.py CustomFader 造型 1:1 移植）：
+    顶部标题、深色凹槽 + 中线、刻度数字、贴图推子帽、底部数值文本。
+
+    command 无参回调，set_value / set_muted 语义与 HSlider 相同，可互换；
+    标题/数值文本内嵌画布（set_title_text / set_val_text 编程更新，
+    内容未变时跳过重绘）；点击底部数值文本触发 on_label_click（静音），
+    该区域点击不计入拖动。推子帽贴图 assets/icons/fader.png 缺失时
+    回退自绘矩形把手。
+    """
+
+    def __init__(self, parent, lo, hi, value, step, command=None,
+                 sizes=None, fonts=None, height=100, thumb_h=26,
+                 title_text="", on_label_click=None):
+        self.sizes = sizes if sizes is not None else make_sizes(100)
+        self.fonts = fonts if fonts is not None else {}
+        super().__init__(parent, width=self.sizes["win_w"] // 2,
+                         height=height, bg=theme.FADERSLIDER_RECTANGLE,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self.lo, self.hi, self.step = float(lo), float(hi), float(step)
+        self.value = float(value)
+        self.command = command
+        self._h = height
+        self._track_h = 12        # 槽厚
+        self._margin = 30        # 两端留白（容纳 +/- 符号）
+        self._muted = False      # 静音态：推子帽换红色贴图（缺失时红矩形）
+        self._title_text = title_text
+        self._val_text = "--%"
+        self._thumb = None
+        self._thumb_red = None   # 红色副本（静音态），首次静音时惰性生成
+        self._thumb_w = 18       # 回退矩形把手宽
+        self._thumb_h = thumb_h
+        self._geom_key = None    # 静态项缓存键：几何变化才整体重建
+        try:
+            path = _fader_png_path()
+            if path:
+                raw = tk.PhotoImage(file=path)
+                f = max(1, round(raw.height() / thumb_h))
+                self._thumb = raw.subsample(f, f)
+                self._raw_img = raw   # 持引用防 PhotoImage 被回收
+        except Exception:
+            self._thumb = None
+        self.bind("<Button-1>", self._on_drag)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<Configure>", lambda e: self._draw())
+        if on_label_click is not None:
+            self.tag_bind("val_text", "<Button-1>", on_label_click)
+        self._draw()
+
+    # ── 几何 ──
+    def _geom(self):
+        """(实际宽, 轨道起点, 轨道终点, 轨道中心 y)。宽随 pack 实时取。
+
+        端点留白须 ≥ 半个帽宽：帽中心行程覆盖全程轨道（复刻原版——
+        最右时帽中心线正压 100 刻线/轨端），帽体向轨端外溢半宽。"""
+        w = self.winfo_width()
+        w = w if w > 8 else int(self["width"])
+        m = max(self._margin, self._cap_w() // 2 + 8)
+        ts = m
+        te = max(ts + 40, w - m)
+        ty = self._h // 2 - 4    # 轨道中心（上移给标题/刻度/底部文本留位）
+        return w, ts, te, ty
+
+    def _cap_w(self):
+        return self._thumb.width() if self._thumb is not None else self._thumb_w
+
+    def _red_thumb(self):
+        """贴图帽的红色副本（静音态显示，保留帽形与透明边缘）。
+
+        按像素与主题红（STOP_HOVER）混色生成——0.7 红覆盖 + 0.3 原色
+        保留明暗层次；首次静音时惰性构建并缓存，之后零开销。"""
+        if self._thumb_red is None and self._thumb is not None:
+            img = self._thumb
+            g = img.copy()
+            w, h = img.width(), img.height()
+            _hex = theme.STOP_HOVER
+            tr, tg, tb = (int(_hex[1:3], 16), int(_hex[3:5], 16),
+                          int(_hex[5:7], 16))
+            for y in range(h):
+                for x in range(w):
+                    if not g.transparency_get(x, y):
+                        r, gg, b = g.get(x, y)
+                        g.put("#%02x%02x%02x" % (
+                            int(r * 0.3 + tr * 0.7),
+                            int(gg * 0.3 + tg * 0.7),
+                            int(b * 0.3 + tb * 0.7)), to=(x, y))
+            self._thumb_red = g   # 持引用防 PhotoImage 被回收
+        return self._thumb_red
+
+    def in_label_zone(self, y):
+        """y 是否落在底部数值文本区。外部拖动跟踪须排除该区——点击
+        静音文本不能被当成拖动松手而误写音量。"""
+        return y >= self._h - 24
+
+    def _val_to_x(self, v):
+        """取值 → 帽中心 x：全程轨道映射（复刻原版 create_thumb），
+        两端取值时帽中心线正好压住端刻线/轨端。"""
+        _, ts, te, _ty = self._geom()
+        frac = (v - self.lo) / max(1e-9, self.hi - self.lo)
+        return ts + int(frac * (te - ts))
+
+    def _x_to_val(self, ex):
+        _, ts, te, _ty = self._geom()
+        frac = (ex - ts) / max(1, te - ts)
+        frac = max(0.0, min(1.0, frac))
+        v = self.lo + frac * (self.hi - self.lo)
+        if self.step:
+            v = round(v / self.step) * self.step
+            v = max(self.lo, min(self.hi, v))
+        return v
+
+    # ── 绘制 ──
+    def _build_static(self, w, ts, te, ty):
+        """一次性建齐不随取值变化的静态项（几何变化时才整体重建）。
+
+        配色复刻 tests/test_slider.py CustomFader 深色模块，画布底用
+        theme.OUTPUT_ROW_BODY（浅暖灰，贴合羊皮纸浅色主题）：标题 #b0a0d0、槽体 #0a0a0a+
+        描边 #111111+中线 #333333、刻线 #888888、数字 #aaaaaa、
+        端符号 #ffffff、数值 #cccccc。"""
+        # 顶部标题（画布内顶部居中，单行）
+        self.create_text(w / 2, 16, text=self._title_text,
+                         fill="#b0a0d0", font=self.fonts.get("small"),
+                         tags="title_text")
+        # 凹槽：1:1 复刻 tests/test_slider.py CustomFader——近黑槽体
+        # + 略亮描边 + 中线（中线是凹槽质感的来源）
+        th = self._track_h
+        self.create_rectangle(ts, ty - th / 2, te, ty + th / 2,
+                              fill="#0a0a0a", outline="#111111", width=1)
+        self.create_line(ts, ty, te, ty,
+                         fill="#333333", width=1)
+        # 刻度（11 根 #888888 刻线 + #aaaaaa 数字，复刻原版）
+        for i in range(11):
+            tx = ts + (te - ts) * i / 10
+            self.create_line(tx, ty + 13, tx, ty + 19,
+                             fill="#888888", width=1)
+            self.create_text(
+                tx, ty + 28,
+                text=str(int(round(self.lo + (self.hi - self.lo) * i / 10))),
+                fill="#aaaaaa", font=self.fonts.get("small"))
+        # 端符号
+        self.create_text(ts - 16, ty, text="-",
+                         fill="#ffffff", font=self.fonts.get("bold"))
+        self.create_text(te + 16, ty, text="+",
+                         fill="#ffffff", font=self.fonts.get("bold"))
+        # 推子帽两态占位（贴图 / 回退矩形），绘制时按静音态切显隐
+        kw = {"image": self._thumb} if self._thumb is not None else {}
+        self.create_image(0, 0, anchor="center", tags="thumb_img",
+                          state="hidden", **kw)
+        self.create_rectangle(0, 0, 0, 0, width=0, tags="thumb_rect",
+                              state="hidden")
+        # 底部数值/静音文本（tag_bind 按标签绑定，重建后依然生效）
+        self.create_text(w / 2, self._h - 10, text=self._val_text,
+                         fill="#cccccc", font=self.fonts.get("bold"),
+                         tags="val_text")
+
+    def _draw(self):
+        """重绘：静态项（槽/刻度/符号）缓存复用，拖动只更新推子帽坐标
+        与标题/数值文本——避免每步 delete+重建 ~35 个画布项造成卡顿。"""
+        w, ts, te, ty = self._geom()
+        if self._geom_key != (w, ts, te, ty):
+            self.delete("all")
+            self._build_static(w, ts, te, ty)
+            self._geom_key = (w, ts, te, ty)
+        # 标题/数值文本（编程更新入口经此生效；内容未变时 Tcl 侧开销极小）
+        self.itemconfigure("title_text", text=self._title_text)
+        self.itemconfigure("val_text", text=self._val_text)
+        # 推子帽：贴图（静音态换红色副本，保留帽形）；贴图缺失时回退矩形
+        x = self._val_to_x(self.value)
+        if self._thumb is not None:
+            img = self._thumb if not self._muted else self._red_thumb()
+            self.itemconfigure("thumb_img", image=img, state="normal")
+            self.itemconfigure("thumb_rect", state="hidden")
+        else:
+            hw = self._thumb_w
+            clr = theme.STOP_BG if self._muted else "#cccccc"
+            self.itemconfigure("thumb_rect", state="normal", fill=clr)
+            self.itemconfigure("thumb_img", state="hidden")
+            self.coords("thumb_rect", x - hw // 2, ty - self._thumb_h // 2,
+                        x + hw // 2, ty + self._thumb_h // 2)
+        self.coords("thumb_img", x, ty)
+
+    # ── 交互 ──
+    def _set_from_x(self, ex):
+        v = self._x_to_val(ex)
+        if v != self.value:
+            self.value = v
+            self._draw()
+            if self.command:
+                try:
+                    self.command()
+                except Exception:
+                    pass
+
+    def _on_drag(self, e):
+        if self.in_label_zone(e.y):
+            return   # 底部数值文本区 = 静音点击区，不参与拖动取值
+        self._set_from_x(e.x)
+
+    def set_value(self, v, silent=False):
+        """编程式设值（进度回显用）；silent=True 不触发 command。"""
+        self.value = min(max(float(v), self.lo), self.hi)
+        self._draw()
+        if not silent and self.command:
+            self.command()
+
+    def set_muted(self, muted: bool):
+        """切换静音态：推子帽换红色副本。状态未变则跳过重绘。"""
+        m = bool(muted)
+        if m != self._muted:
+            self._muted = m
+            self._draw()
+
+    def set_title_text(self, text: str):
+        """更新顶部标题（内容未变则跳过重绘，viz tick 30fps 调用）。"""
+        if text != self._title_text:
+            self._title_text = text
+            self._draw()
+
+    def set_val_text(self, text: str):
+        """更新底部数值/静音文本（内容未变则跳过重绘）。"""
+        if text != self._val_text:
+            self._val_text = text
+            self._draw()
+
+
 class DarkCombo(tk.Frame):
     """深色下拉（弹层与外框严格同宽，长项像素级省略）——参考 lite BlackCombo。
     """
